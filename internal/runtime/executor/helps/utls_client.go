@@ -20,15 +20,58 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using a Chrome fingerprint for
-// providers that require browser-like TLS. The HTTP version follows ALPN. Each
-// request gets a dedicated connection that is closed with the response body.
+// chromeClientHelloID is the default ClientHello (chrome_131) for chatgpt.com.
+// Per-account fingerprint_profile may select chrome_120 / safari_17 instead.
+// Application User-Agent (e.g. Codex) is set by callers and is intentionally
+// not rewritten here; operators should align custom UA with the profile.
+var chromeClientHelloID = tls.HelloChrome_131
+
+const chromeRoundTripperCacheCapacity = 64
+
+var chromeRoundTripperCache = internalcache.NewBoundedLRU[string, http.RoundTripper](
+	chromeRoundTripperCacheCapacity,
+	func(_ string, roundTripper http.RoundTripper) {
+		if transport, ok := roundTripper.(interface{ CloseIdleConnections() }); ok {
+			transport.CloseIdleConnections()
+		}
+	},
+)
+
+func chromeRoundTripperCacheKey(proxyURL, profileName string) string {
+	if profileName == "" {
+		profileName = BrowserFingerprintProfileChrome131
+	}
+	return proxyURL + "\x00" + profileName
+}
+
+func cachedChromeRoundTripper(proxyURL string) http.RoundTripper {
+	return cachedChromeRoundTripperForProfile(proxyURL, browserFingerprintChrome131)
+}
+
+func cachedChromeRoundTripperForProfile(proxyURL string, profile *browserFingerprintProfile) http.RoundTripper {
+	if profile == nil {
+		profile = browserFingerprintChrome131
+	}
+	key := chromeRoundTripperCacheKey(proxyURL, profile.Name)
+	return chromeRoundTripperCache.GetOrAdd(key, func() http.RoundTripper {
+		return newUtlsRoundTripperForProfile(proxyURL, profile)
+	})
+}
+
+// utlsRoundTripper implements http.RoundTripper using a matched browser TLS +
+// HTTP/2 Akamai fingerprint for providers that require browser-like wire
+// identity. The HTTP version follows ALPN. Idle HTTP/2 connections are pooled
+// per RoundTripper keyed by (proxyURL, fingerprint_profile); an open response
+// body (including SSE) holds its connection exclusively until Close.
 type utlsRoundTripper struct {
-	dialer proxy.Dialer
+	dialer  proxy.Dialer
+	profile *browserFingerprintProfile
+
+	mu   sync.Mutex
+	idle []*chromeH2Conn
 }
 
 type closeConnectionBody struct {
@@ -57,6 +100,13 @@ func (b *closeConnectionBody) Close() error {
 }
 
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+	return newUtlsRoundTripperForProfile(proxyURL, browserFingerprintChrome131)
+}
+
+func newUtlsRoundTripperForProfile(proxyURL string, profile *browserFingerprintProfile) *utlsRoundTripper {
+	if profile == nil {
+		profile = browserFingerprintChrome131
+	}
 	var dialer proxy.Dialer = proxy.Direct
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
@@ -66,7 +116,45 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 			dialer = proxyDialer
 		}
 	}
-	return &utlsRoundTripper{dialer: dialer}
+	return &utlsRoundTripper{dialer: dialer, profile: profile}
+}
+
+func (t *utlsRoundTripper) CloseIdleConnections() {
+	t.mu.Lock()
+	idle := t.idle
+	t.idle = nil
+	t.mu.Unlock()
+	for _, c := range idle {
+		_ = c.Close()
+	}
+}
+
+func (t *utlsRoundTripper) putIdle(c *chromeH2Conn) {
+	if c == nil {
+		return
+	}
+	t.mu.Lock()
+	if c.isReusable() && len(t.idle) < 8 {
+		t.idle = append(t.idle, c)
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Unlock()
+	_ = c.Close()
+}
+
+func (t *utlsRoundTripper) takeIdle() *chromeH2Conn {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for len(t.idle) > 0 {
+		c := t.idle[len(t.idle)-1]
+		t.idle = t.idle[:len(t.idle)-1]
+		if c.isReusable() {
+			return c
+		}
+		_ = c.Close()
+	}
+	return nil
 }
 
 func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*tls.UConn, error) {
@@ -80,7 +168,11 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	hello := chromeClientHelloID
+	if t.profile != nil {
+		hello = t.profile.ClientHello
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, hello)
 
 	handshakeCtx, cancelHandshake := handshakeContext(ctx)
 	defer cancelHandshake()
@@ -99,6 +191,27 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "https" {
+		if idle := t.takeIdle(); idle != nil {
+			resp, err := idle.roundTrip(req)
+			if err == nil {
+				if body, ok := resp.Body.(*chromeH2Body); ok {
+					body.readCtx = req.Context()
+					body.onClose = func(reusable bool) {
+						if reusable {
+							t.putIdle(idle)
+						} else {
+							_ = idle.Close()
+						}
+					}
+				}
+				return resp, nil
+			}
+			_ = idle.Close()
+			// Fall through to a fresh dial on idle failure.
+		}
+	}
+
 	hostname := req.URL.Hostname()
 	port := req.URL.Port()
 	if port == "" {
@@ -110,12 +223,18 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
-	return roundTripUtlsConnection(req, tlsConn)
+	return t.roundTripFresh(req, tlsConn)
+}
+
+func (t *utlsRoundTripper) roundTripFresh(req *http.Request, tlsConn *tls.UConn) (*http.Response, error) {
+	return roundTripUtlsConnection(req, tlsConn, t)
 }
 
 // roundTripUtlsConnection selects the HTTP protocol before sending the request.
 // Empty ALPN is HTTP/1.1, including when a TLS-inspecting proxy omits ALPN.
-func roundTripUtlsConnection(req *http.Request, tlsConn *tls.UConn) (*http.Response, error) {
+// pool may be nil in tests; when set, successful h2 responses can return the
+// chromeH2Conn to the RoundTripper idle list after Body.Close.
+func roundTripUtlsConnection(req *http.Request, tlsConn *tls.UConn, pool *utlsRoundTripper) (*http.Response, error) {
 	closeConnection := func() error {
 		// The HTTP/1.1 transport may already have closed its non-pooled
 		// connection after reading the response or canceling the request.
@@ -128,13 +247,35 @@ func roundTripUtlsConnection(req *http.Request, tlsConn *tls.UConn) (*http.Respo
 	var err error
 	switch protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol {
 	case "h2":
-		h2Conn, errClientConn := (&http2.Transport{}).NewClientConn(tlsConn)
-		if errClientConn != nil {
-			err = fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
+		profile := browserFingerprintChrome131
+		if pool != nil && pool.profile != nil {
+			profile = pool.profile
+		}
+		chromeConn, errChrome := newChromeH2ConnWithProfile(tlsConn, profile)
+		if errChrome != nil {
+			err = fmt.Errorf("utls: initialize Chrome HTTP/2 connection: %w", errChrome)
 			break
 		}
-		closeConnection = h2Conn.Close
-		resp, err = h2Conn.RoundTrip(req)
+		resp, err = chromeConn.roundTrip(req)
+		if err != nil {
+			_ = chromeConn.Close()
+			break
+		}
+		if body, ok := resp.Body.(*chromeH2Body); ok {
+			body.readCtx = req.Context()
+			body.onClose = func(reusable bool) {
+				if pool != nil && reusable {
+					pool.putIdle(chromeConn)
+					return
+				}
+				_ = chromeConn.Close()
+			}
+		} else {
+			closeConnection = chromeConn.Close
+		}
+		// Successful h2 path: do not wrap with closeConnectionBody that would
+		// tear down a pooled chrome connection while the stream body is open.
+		return resp, nil
 	case "", "http/1.1":
 		// Reuse the already-handshaken uTLS connection. A fresh, non-pooling
 		// transport retains net/http's cancellation and request-body handling
@@ -498,7 +639,8 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var chromeRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	browserProfile := BrowserFingerprintProfileFromAuth(auth)
+	var chromeRT http.RoundTripper = cachedChromeRoundTripperForProfile(proxyURL, browserProfile)
 	var anthropicRT http.RoundTripper = cachedClaudeCodeRoundTripper(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	var anthropicFn, fallbackFn func() http.RoundTripper
