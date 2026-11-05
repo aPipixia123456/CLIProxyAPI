@@ -60,22 +60,29 @@ type chromeH2Conn struct {
 	henc *hpack.Encoder
 	hbuf bytes.Buffer
 
-	mu        sync.Mutex
-	nextID    uint32
-	sendWin   int64
-	maxFrame  uint32
-	broken    bool
-	busy      bool // response body outstanding
-	closeOnce sync.Once
-	closeErr  error
+	mu     sync.Mutex
+	nextID uint32
+	// Separate connection-level and stream-level outbound windows (RFC 7540 §6.9).
+	// SETTINGS_INITIAL_WINDOW_SIZE only affects stream windows; the connection
+	// window starts at 65535 and grows only via WINDOW_UPDATE(stream=0).
+	connSendWin          int64
+	streamSendWin        int64 // active request stream; single-stream client
+	peerInitialStreamWin int64 // last SETTINGS_INITIAL_WINDOW_SIZE from peer
+	maxFrame             uint32
+	broken               bool
+	busy                 bool // response body outstanding
+	closeOnce            sync.Once
+	closeErr             error
 }
 
 func newChromeH2Conn(conn net.Conn) (*chromeH2Conn, error) {
 	c := &chromeH2Conn{
-		conn:     conn,
-		nextID:   1,
-		sendWin:  chromeH2DefaultStreamSendWin,
-		maxFrame: chromeH2DefaultMaxFrame,
+		conn:                 conn,
+		nextID:               1,
+		connSendWin:          chromeH2DefaultStreamSendWin,
+		streamSendWin:        chromeH2DefaultStreamSendWin,
+		peerInitialStreamWin: chromeH2DefaultStreamSendWin,
+		maxFrame:             chromeH2DefaultMaxFrame,
 	}
 	c.henc = hpack.NewEncoder(&c.hbuf)
 	c.fr = http2.NewFramer(conn, conn)
@@ -128,6 +135,8 @@ func (c *chromeH2Conn) roundTrip(req *http.Request) (*http.Response, error) {
 
 	streamID := c.nextID
 	c.nextID += 2
+	// New stream inherits the peer's current SETTINGS_INITIAL_WINDOW_SIZE.
+	c.streamSendWin = c.peerInitialStreamWin
 
 	var bodyBytes []byte
 	if req.Body != nil && req.Body != http.NoBody {
@@ -277,15 +286,19 @@ func (c *chromeH2Conn) writeDataLocked(ctx context.Context, streamID uint32, bod
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		avail := c.connSendWin
+		if c.streamSendWin < avail {
+			avail = c.streamSendWin
+		}
 		n := len(body)
-		if int64(n) > c.sendWin {
-			n = int(c.sendWin)
+		if int64(n) > avail {
+			n = int(avail)
 		}
 		if n > int(c.maxFrame) {
 			n = int(c.maxFrame)
 		}
 		if n <= 0 {
-			if err := c.drainControlLocked(ctx); err != nil {
+			if err := c.drainControlLocked(ctx, streamID); err != nil {
 				return err
 			}
 			continue
@@ -294,7 +307,8 @@ func (c *chromeH2Conn) writeDataLocked(ctx context.Context, streamID uint32, bod
 		if err := c.fr.WriteData(streamID, end, body[:n]); err != nil {
 			return err
 		}
-		c.sendWin -= int64(n)
+		c.connSendWin -= int64(n)
+		c.streamSendWin -= int64(n)
 		body = body[n:]
 	}
 	return nil
@@ -344,14 +358,14 @@ func (c *chromeH2Conn) readResponseHeadersLocked(ctx context.Context, streamID u
 				return 0, nil, false, fmt.Errorf("chrome h2: GOAWAY: %v", f.ErrCode)
 			}
 		default:
-			if err := c.handleControlLocked(f); err != nil {
+			if err := c.handleControlLocked(f, streamID); err != nil {
 				return 0, nil, false, err
 			}
 		}
 	}
 }
 
-func (c *chromeH2Conn) drainControlLocked(ctx context.Context) error {
+func (c *chromeH2Conn) drainControlLocked(ctx context.Context, streamID uint32) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -359,29 +373,65 @@ func (c *chromeH2Conn) drainControlLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.handleControlLocked(frame)
+	return c.handleControlLocked(frame, streamID)
 }
 
-func (c *chromeH2Conn) handleControlLocked(frame http2.Frame) error {
+// handleControlLocked processes non-HEADERS/DATA control frames.
+// streamID is the active request stream (0 if none); RST for that stream is fatal.
+func (c *chromeH2Conn) handleControlLocked(frame http2.Frame, streamID uint32) error {
 	switch f := frame.(type) {
+	case *http2.MetaHeadersFrame:
+		return fmt.Errorf("chrome h2: unexpected HEADERS on stream %d while waiting for flow control", f.StreamID)
+	case *http2.DataFrame:
+		return fmt.Errorf("chrome h2: unexpected DATA on stream %d while waiting for flow control", f.StreamID)
 	case *http2.SettingsFrame:
 		if !f.IsAck() {
+			var err error
 			f.ForeachSetting(func(s http2.Setting) error {
 				switch s.ID {
 				case http2.SettingInitialWindowSize:
-					c.sendWin = int64(s.Val)
+					// RFC 7540 §6.9.2: adjust existing stream windows by the
+					// delta; connection window is unchanged.
+					if s.Val > 0x7fffffff {
+						err = fmt.Errorf("chrome h2: INITIAL_WINDOW_SIZE too large: %d", s.Val)
+						return err
+					}
+					newInit := int64(s.Val)
+					delta := newInit - c.peerInitialStreamWin
+					c.peerInitialStreamWin = newInit
+					c.streamSendWin += delta
+					if c.streamSendWin > 0x7fffffff {
+						err = errors.New("chrome h2: stream flow-control window overflow")
+						return err
+					}
 				case http2.SettingMaxFrameSize:
-					if s.Val >= chromeH2DefaultMaxFrame {
+					if s.Val >= chromeH2DefaultMaxFrame && s.Val <= 0xffffff {
 						c.maxFrame = s.Val
 					}
 				}
 				return nil
 			})
+			if err != nil {
+				return err
+			}
 			return c.fr.WriteSettingsAck()
 		}
 	case *http2.WindowUpdateFrame:
+		if f.Increment == 0 {
+			return fmt.Errorf("chrome h2: WINDOW_UPDATE increment 0 on stream %d", f.StreamID)
+		}
 		if f.StreamID == 0 {
-			c.sendWin += int64(f.Increment)
+			sum := c.connSendWin + int64(f.Increment)
+			if sum > 0x7fffffff {
+				return errors.New("chrome h2: connection flow-control window overflow")
+			}
+			c.connSendWin = sum
+		} else if streamID != 0 && f.StreamID == streamID {
+			sum := c.streamSendWin + int64(f.Increment)
+			if sum > 0x7fffffff {
+				return errors.New("chrome h2: stream flow-control window overflow")
+			}
+			c.streamSendWin = sum
 		}
 	case *http2.PingFrame:
 		if !f.IsAck() {
@@ -389,8 +439,13 @@ func (c *chromeH2Conn) handleControlLocked(frame http2.Frame) error {
 		}
 	case *http2.GoAwayFrame:
 		c.markBroken()
+		if streamID != 0 && streamID > f.LastStreamID {
+			return fmt.Errorf("chrome h2: GOAWAY: %v", f.ErrCode)
+		}
 	case *http2.RSTStreamFrame:
-		// Ignore RST for other streams.
+		if streamID != 0 && f.StreamID == streamID {
+			return fmt.Errorf("chrome h2: stream reset: %v", f.ErrCode)
+		}
 	}
 	return nil
 }
@@ -410,9 +465,10 @@ func (c *chromeH2Conn) readBodyFrameLocked(ctx context.Context, streamID uint32)
 				continue
 			}
 			payload := append([]byte(nil), f.Data()...)
-			if n := len(payload); n > 0 {
-				_ = c.fr.WriteWindowUpdate(0, uint32(n))
-				_ = c.fr.WriteWindowUpdate(streamID, uint32(n))
+			// Flow control is charged for the full frame length (incl. padding).
+			if f.Length > 0 {
+				_ = c.fr.WriteWindowUpdate(0, f.Length)
+				_ = c.fr.WriteWindowUpdate(streamID, f.Length)
 			}
 			return payload, f.StreamEnded(), nil
 		case *http2.MetaHeadersFrame:
@@ -430,7 +486,7 @@ func (c *chromeH2Conn) readBodyFrameLocked(ctx context.Context, streamID uint32)
 				return nil, false, fmt.Errorf("chrome h2: GOAWAY: %v", f.ErrCode)
 			}
 		default:
-			if err := c.handleControlLocked(f); err != nil {
+			if err := c.handleControlLocked(f, streamID); err != nil {
 				return nil, false, err
 			}
 		}

@@ -303,3 +303,626 @@ func tlsClientForTestServer(t *testing.T, conn net.Conn, server *httptest.Server
 	}
 	return tlsConn
 }
+
+// TestChromeH2SendFlowControlRespectsConnAndStreamWindows verifies that a large
+// request body is split across DATA frames and never exceeds the peer's
+// connection or stream send windows — the bug that produced
+// FLOW_CONTROL_ERROR against chatgpt.com (SETTINGS_INITIAL_WINDOW_SIZE was
+// incorrectly applied as the connection window).
+func TestChromeH2SendFlowControlRespectsConnAndStreamWindows(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	const (
+		peerConnWin    = 65535
+		peerStreamInit = 1024 * 1024 // large SETTINGS_INITIAL_WINDOW_SIZE (stream only)
+		bodySize       = 200000      // > 65535 so conn window must throttle
+	)
+	body := bytes.Repeat([]byte("x"), bodySize)
+
+	type result struct {
+		dataBytes int
+		maxFrame  int
+		frames    int
+		sawRST    bool
+	}
+	resCh := make(chan result, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+		buf := make([]byte, len(chromeH2ClientPreface))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			errCh <- err
+			return
+		}
+		fr := http2.NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+
+		// Consume client SETTINGS + WINDOW_UPDATE.
+		if _, err := fr.ReadFrame(); err != nil {
+			errCh <- err
+			return
+		}
+		if _, err := fr.ReadFrame(); err != nil {
+			errCh <- err
+			return
+		}
+
+		// Peer SETTINGS: large stream window MUST NOT enlarge connection window.
+		if err := fr.WriteSettings(http2.Setting{
+			ID: http2.SettingInitialWindowSize, Val: peerStreamInit,
+		}); err != nil {
+			errCh <- err
+			return
+		}
+
+		var (
+			got         result
+			connLeft    = peerConnWin
+			streamLeft  = 65535 // until SETTINGS ACK applied on client; we track what client may legally send
+			streamID    uint32
+			headersDone bool
+		)
+		// After client ACKs SETTINGS, stream window becomes peerStreamInit.
+		// We apply the same rule the client should: conn stays at 65535 (+ our WU).
+		streamLeft = peerStreamInit
+
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			frame, err := fr.ReadFrame()
+			if err != nil {
+				if got.dataBytes == bodySize {
+					break
+				}
+				errCh <- err
+				return
+			}
+			switch f := frame.(type) {
+			case *http2.SettingsFrame:
+				// client ACK — ignore
+			case *http2.MetaHeadersFrame:
+				streamID = f.StreamID
+				headersDone = true
+				if f.StreamEnded() {
+					errCh <- fmt.Errorf("headers ended stream but body expected")
+					return
+				}
+			case *http2.DataFrame:
+				if !headersDone || f.StreamID != streamID {
+					errCh <- fmt.Errorf("unexpected DATA stream=%d", f.StreamID)
+					return
+				}
+				n := len(f.Data())
+				got.frames++
+				if n > got.maxFrame {
+					got.maxFrame = n
+				}
+				if n > connLeft {
+					_ = fr.WriteRSTStream(streamID, http2.ErrCodeFlowControl)
+					got.sawRST = true
+					resCh <- got
+					return
+				}
+				if n > streamLeft {
+					_ = fr.WriteRSTStream(streamID, http2.ErrCodeFlowControl)
+					got.sawRST = true
+					resCh <- got
+					return
+				}
+				connLeft -= n
+				streamLeft -= n
+				got.dataBytes += n
+
+				// Replenish windows like a real peer so the client can finish.
+				if connLeft < 16*1024 && got.dataBytes < bodySize {
+					inc := uint32(32 * 1024)
+					if err := fr.WriteWindowUpdate(0, inc); err != nil {
+						errCh <- err
+						return
+					}
+					connLeft += int(inc)
+				}
+				if streamLeft < 16*1024 && got.dataBytes < bodySize {
+					inc := uint32(64 * 1024)
+					if err := fr.WriteWindowUpdate(streamID, inc); err != nil {
+						errCh <- err
+						return
+					}
+					streamLeft += int(inc)
+				}
+				if f.StreamEnded() {
+					// Respond so roundTrip can complete.
+					var encBuf bytes.Buffer
+					enc := hpack.NewEncoder(&encBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					_ = fr.WriteHeaders(http2.HeadersFrameParam{
+						StreamID:      streamID,
+						BlockFragment: encBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					})
+					resCh <- got
+					return
+				}
+			case *http2.RSTStreamFrame:
+				got.sawRST = true
+				resCh <- got
+				return
+			}
+		}
+		errCh <- fmt.Errorf("timeout: got %d/%d body bytes", got.dataBytes, bodySize)
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	chromeConn, err := newChromeH2Conn(clientConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := chromeConn.roundTrip(req)
+	if err != nil {
+		t.Fatalf("roundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case got := <-resCh:
+		if got.sawRST {
+			t.Fatalf("peer sent FLOW_CONTROL RST after %d bytes (client overshot window)", got.dataBytes)
+		}
+		if got.dataBytes != bodySize {
+			t.Fatalf("data bytes = %d, want %d", got.dataBytes, bodySize)
+		}
+		if got.maxFrame > int(chromeH2DefaultMaxFrame) {
+			t.Fatalf("max DATA frame %d > maxFrame %d", got.maxFrame, chromeH2DefaultMaxFrame)
+		}
+		if got.frames < 2 {
+			t.Fatalf("expected multi-frame DATA, got %d frames", got.frames)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("timed out waiting for peer result")
+	}
+}
+
+// TestChromeH2SettingsInitialWindowDoesNotExpandConnWindow ensures a large
+// peer SETTINGS_INITIAL_WINDOW_SIZE only grows the stream window. A body
+// bigger than the still-65535 connection window must block until a
+// connection-level WINDOW_UPDATE arrives (otherwise peer would RST with
+// FLOW_CONTROL_ERROR).
+func TestChromeH2SettingsInitialWindowDoesNotExpandConnWindow(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	const bodySize = 70000 // just over default conn window
+	body := bytes.Repeat([]byte("y"), bodySize)
+
+	progress := make(chan int, 8)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+		buf := make([]byte, len(chromeH2ClientPreface))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			errCh <- err
+			return
+		}
+		fr := http2.NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		if _, err := fr.ReadFrame(); err != nil { // SETTINGS
+			errCh <- err
+			return
+		}
+		if _, err := fr.ReadFrame(); err != nil { // WU
+			errCh <- err
+			return
+		}
+		// Advertise a huge stream window — buggy clients treat this as conn win.
+		if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 6 << 20}); err != nil {
+			errCh <- err
+			return
+		}
+
+		var (
+			streamID   uint32
+			got        int
+			connCredit = 65535
+		)
+		for {
+			frame, err := fr.ReadFrame()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			switch f := frame.(type) {
+			case *http2.SettingsFrame:
+				// ACK
+			case *http2.MetaHeadersFrame:
+				streamID = f.StreamID
+			case *http2.DataFrame:
+				n := len(f.Data())
+				if n > connCredit {
+					_ = fr.WriteRSTStream(f.StreamID, http2.ErrCodeFlowControl)
+					errCh <- fmt.Errorf("client sent %d bytes with only %d conn credit left (FLOW_CONTROL)", n, connCredit)
+					return
+				}
+				connCredit -= n
+				got += n
+				progress <- got
+				if got == 65535 {
+					// Client must stop here until we grant more conn window.
+					time.Sleep(200 * time.Millisecond)
+					if err := fr.WriteWindowUpdate(0, uint32(bodySize)); err != nil {
+						errCh <- err
+						return
+					}
+					connCredit += bodySize
+					// Also top up stream window (already large via SETTINGS).
+					if err := fr.WriteWindowUpdate(streamID, uint32(bodySize)); err != nil {
+						errCh <- err
+						return
+					}
+				}
+				if f.StreamEnded() {
+					var encBuf bytes.Buffer
+					enc := hpack.NewEncoder(&encBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "204"})
+					_ = fr.WriteHeaders(http2.HeadersFrameParam{
+						StreamID:      streamID,
+						BlockFragment: encBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					})
+					return
+				}
+			}
+		}
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	chromeConn, err := newChromeH2Conn(clientConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://chatgpt.com/upload", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := chromeConn.roundTrip(req)
+	if err != nil {
+		t.Fatalf("roundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	// Ensure we observed the stall at the conn window boundary.
+	saw65535 := false
+	timeout := time.After(2 * time.Second)
+	for !saw65535 {
+		select {
+		case n := <-progress:
+			if n == 65535 {
+				saw65535 = true
+			}
+			if n == bodySize {
+				saw65535 = true
+			}
+		case err := <-errCh:
+			t.Fatal(err)
+		case <-timeout:
+			t.Fatal("did not observe progress through conn window")
+		}
+	}
+}
+
+// TestChromeH2ReceiveWindowUpdateOnSSEData ensures reading a multi-frame SSE
+// body returns WINDOW_UPDATE on both connection and stream (long responses).
+func TestChromeH2ReceiveWindowUpdateOnSSEData(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	wuCh := make(chan []http2.WindowUpdateFrame, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+		buf := make([]byte, len(chromeH2ClientPreface))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			errCh <- err
+			return
+		}
+		fr := http2.NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		if _, err := fr.ReadFrame(); err != nil {
+			errCh <- err
+			return
+		}
+		clientWU, err := fr.ReadFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if _, ok := clientWU.(*http2.WindowUpdateFrame); !ok {
+			errCh <- fmt.Errorf("want preface WINDOW_UPDATE, got %T", clientWU)
+			return
+		}
+		hdr, err := fr.ReadFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		mh, ok := hdr.(*http2.MetaHeadersFrame)
+		if !ok {
+			errCh <- fmt.Errorf("want HEADERS, got %T", hdr)
+			return
+		}
+		var encBuf bytes.Buffer
+		enc := hpack.NewEncoder(&encBuf)
+		_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/event-stream"})
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      mh.StreamID,
+			BlockFragment: encBuf.Bytes(),
+			EndHeaders:    true,
+		}); err != nil {
+			errCh <- err
+			return
+		}
+		chunk1 := []byte("data: aaa\n\n")
+		chunk2 := []byte("data: bbb\n\n")
+		if err := fr.WriteData(mh.StreamID, false, chunk1); err != nil {
+			errCh <- err
+			return
+		}
+		if err := fr.WriteData(mh.StreamID, true, chunk2); err != nil {
+			errCh <- err
+			return
+		}
+
+		var wus []http2.WindowUpdateFrame
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && len(wus) < 4 {
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			frame, err := fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			if wu, ok := frame.(*http2.WindowUpdateFrame); ok {
+				wus = append(wus, *wu)
+			}
+		}
+		wuCh <- wus
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	chromeConn, err := newChromeH2Conn(clientConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://chatgpt.com/sse", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := chromeConn.roundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if !strings.Contains(string(gotBody), "data: aaa") || !strings.Contains(string(gotBody), "data: bbb") {
+		t.Fatalf("body = %q", gotBody)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case wus := <-wuCh:
+		var connWU, streamWU int
+		for _, wu := range wus {
+			if wu.StreamID == 0 {
+				connWU++
+			} else {
+				streamWU++
+			}
+		}
+		if connWU < 2 || streamWU < 2 {
+			t.Fatalf("WINDOW_UPDATE counts conn=%d stream=%d (want >=2 each) frames=%v", connWU, streamWU, wus)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("timed out waiting for WINDOW_UPDATE capture")
+	}
+}
+
+// TestChromeH2StreamWindowUpdateIsRequired verifies stream-level WINDOW_UPDATE
+// is honored independently of the connection window.
+func TestChromeH2StreamWindowUpdateIsRequired(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	const bodySize = 80000 // force drain after default 65535 so SETTINGS is applied mid-body
+	body := bytes.Repeat([]byte("z"), bodySize)
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+		buf := make([]byte, len(chromeH2ClientPreface))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			errCh <- err
+			return
+		}
+		fr := http2.NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		_, _ = fr.ReadFrame()
+		_, _ = fr.ReadFrame()
+		// Shrink stream window via SETTINGS. Client applies on read (mid-body drain).
+		if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1000}); err != nil {
+			errCh <- err
+			return
+		}
+
+		var (
+			streamID      uint32
+			got           int
+			connCredit    = 65535
+			settingsAcked bool
+			postAckData   int
+		)
+		for {
+			frame, err := fr.ReadFrame()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			switch f := frame.(type) {
+			case *http2.SettingsFrame:
+				if f.IsAck() && !settingsAcked {
+					settingsAcked = true
+					// After ACK, client stream window is negative (sent 65535, init now 1000).
+					// Grant stream + conn credit so the remainder can flow.
+					if err := fr.WriteWindowUpdate(0, uint32(bodySize)); err != nil {
+						errCh <- err
+						return
+					}
+					connCredit += bodySize
+					if err := fr.WriteWindowUpdate(streamID, uint32(bodySize)); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			case *http2.MetaHeadersFrame:
+				streamID = f.StreamID
+			case *http2.DataFrame:
+				n := len(f.Data())
+				if n > connCredit {
+					_ = fr.WriteRSTStream(f.StreamID, http2.ErrCodeFlowControl)
+					errCh <- fmt.Errorf("conn FLOW_CONTROL: sent %d credit %d", n, connCredit)
+					return
+				}
+				connCredit -= n
+				got += n
+				if settingsAcked {
+					postAckData += n
+				}
+				if f.StreamEnded() {
+					if got != bodySize {
+						errCh <- fmt.Errorf("got %d want %d", got, bodySize)
+						return
+					}
+					if postAckData == 0 {
+						errCh <- fmt.Errorf("expected DATA after SETTINGS ACK (stream WU path)")
+						return
+					}
+					var encBuf bytes.Buffer
+					enc := hpack.NewEncoder(&encBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					_ = fr.WriteHeaders(http2.HeadersFrameParam{
+						StreamID:      streamID,
+						BlockFragment: encBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					})
+					return
+				}
+			}
+		}
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	chromeConn, err := newChromeH2Conn(clientConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://chatgpt.com/x", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := chromeConn.roundTrip(req)
+	if err != nil {
+		t.Fatalf("roundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+	<-done
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+}
