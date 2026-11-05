@@ -1,10 +1,12 @@
-// Command verify_chrome_h2_peet dials https://tls.peet.ws/api/all with a
-// Chrome_131 uTLS ClientHello and Chrome Akamai HTTP/2 SETTINGS, then prints
+// Command verify_chrome_h2_peet dials https://tls.peet.ws/api/all with matched
+// browser TLS ClientHello + HTTP/2 Akamai SETTINGS profiles, then prints
 // ja3/ja4/akamai_fingerprint for PR verification.
 //
 // Usage (from repo root):
 //
 //	go run ./scripts/verify_chrome_h2_peet.go
+//	PROFILE=chrome_120 go run ./scripts/verify_chrome_h2_peet.go
+//	PROFILE=all go run ./scripts/verify_chrome_h2_peet.go
 //
 // Optional COMPARE_GO=1 also prints a bare net/http baseline.
 package main
@@ -26,31 +28,116 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-const (
-	peetURL = "https://tls.peet.ws/api/all"
+const peetURL = "https://tls.peet.ws/api/all"
 
-	chromeH2HeaderTableSize   uint32 = 65536
-	chromeH2EnablePush        uint32 = 0
-	chromeH2InitialWindowSize uint32 = 6291456
-	chromeH2MaxHeaderListSize uint32 = 262144
-	chromeH2ConnWindowUpdate  uint32 = 15663105
-)
+type profileSpec struct {
+	Name             string
+	Hello            utls.ClientHelloID
+	Settings         []http2.Setting
+	ConnWindowUpdate uint32
+	PseudoOrder      []string
+	UA               string
+	WantAkamai       string
+}
 
-var chromeH2Settings = []http2.Setting{
-	{ID: http2.SettingHeaderTableSize, Val: chromeH2HeaderTableSize},
-	{ID: http2.SettingEnablePush, Val: chromeH2EnablePush},
-	{ID: http2.SettingInitialWindowSize, Val: chromeH2InitialWindowSize},
-	{ID: http2.SettingMaxHeaderListSize, Val: chromeH2MaxHeaderListSize},
+func profiles() []profileSpec {
+	chromeSettings := []http2.Setting{
+		{ID: http2.SettingHeaderTableSize, Val: 65536},
+		{ID: http2.SettingEnablePush, Val: 0},
+		{ID: http2.SettingInitialWindowSize, Val: 6291456},
+		{ID: http2.SettingMaxHeaderListSize, Val: 262144},
+	}
+	chromeAkamai := "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"
+	return []profileSpec{
+		{
+			Name:             "chrome_131",
+			Hello:            utls.HelloChrome_131,
+			Settings:         chromeSettings,
+			ConnWindowUpdate: 15663105,
+			PseudoOrder:      []string{":method", ":authority", ":scheme", ":path"},
+			UA:               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+			WantAkamai:       chromeAkamai,
+		},
+		{
+			Name:             "chrome_120",
+			Hello:            utls.HelloChrome_120,
+			Settings:         chromeSettings,
+			ConnWindowUpdate: 15663105,
+			PseudoOrder:      []string{":method", ":authority", ":scheme", ":path"},
+			UA:               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			WantAkamai:       chromeAkamai,
+		},
+		{
+			Name:  "safari_17",
+			Hello: utls.HelloSafari_16_0,
+			Settings: []http2.Setting{
+				{ID: http2.SettingInitialWindowSize, Val: 4194304},
+				{ID: http2.SettingMaxConcurrentStreams, Val: 100},
+			},
+			ConnWindowUpdate: 10485760,
+			PseudoOrder:      []string{":method", ":scheme", ":path", ":authority"},
+			UA:               "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+			WantAkamai:       "4:4194304;3:100|10485760|0|m,s,p,a",
+		},
+	}
 }
 
 func main() {
-	chromeJSON, err := fetchWithChrome()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "chrome path: %v\n", err)
-		os.Exit(1)
+	want := strings.ToLower(strings.TrimSpace(os.Getenv("PROFILE")))
+	if want == "" {
+		want = "chrome_131"
 	}
-	fmt.Println("=== Chrome_131 uTLS + Chrome Akamai H2 (scheme A) ===")
-	printSummary(chromeJSON)
+	selected := make([]profileSpec, 0, 3)
+	for _, p := range profiles() {
+		if want == "all" || want == p.Name {
+			selected = append(selected, p)
+		}
+	}
+	if len(selected) == 0 {
+		fmt.Fprintf(os.Stderr, "unknown PROFILE=%q (use chrome_131, chrome_120, safari_17, or all)\n", want)
+		os.Exit(2)
+	}
+
+	summaries := make([]map[string]any, 0, len(selected))
+	for _, p := range selected {
+		raw, err := fetchWithProfile(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s path: %v\n", p.Name, err)
+			os.Exit(1)
+		}
+		fmt.Printf("=== %s (ClientHello %s/%s + matched H2) ===\n", p.Name, p.Hello.Client, p.Hello.Version)
+		summary := printSummary(raw, p.WantAkamai)
+		summary["profile"] = p.Name
+		summaries = append(summaries, summary)
+	}
+
+	if len(summaries) > 1 {
+		fmt.Println("=== cross-profile uniqueness ===")
+		ja4s := map[string]string{}
+		akamais := map[string]string{}
+		for _, s := range summaries {
+			name, _ := s["profile"].(string)
+			if ja4, _ := s["ja4"].(string); ja4 != "" {
+				if prev, ok := ja4s[ja4]; ok {
+					fmt.Printf("NOTE: ja4 shared by %s and %s (%s); chrome_120/131 share JA4 family — compare ja3\n", prev, name, ja4)
+				} else {
+					ja4s[ja4] = name
+				}
+				fmt.Printf("ja4[%s]=%s\n", name, ja4)
+			}
+			if ja3, _ := s["ja3"].(string); ja3 != "" {
+				fmt.Printf("ja3[%s]=%s\n", name, ja3)
+			}
+			if fp, _ := s["akamai_fingerprint"].(string); fp != "" {
+				akamais[name] = fp
+				fmt.Printf("akamai[%s]=%s\n", name, fp)
+			}
+		}
+		if akamais["chrome_131"] != "" && akamais["safari_17"] != "" && akamais["chrome_131"] == akamais["safari_17"] {
+			fmt.Println("ERROR: chrome_131 and safari_17 must not share akamai_fingerprint")
+			os.Exit(1)
+		}
+	}
 
 	if os.Getenv("COMPARE_GO") == "1" {
 		goJSON, err := fetchWithGo()
@@ -59,35 +146,31 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("=== Go net/http baseline ===")
-		printSummary(goJSON)
+		printSummary(goJSON, "")
 	}
 }
 
-func printSummary(raw []byte) {
+func printSummary(raw []byte, wantAkamai string) map[string]any {
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
 		fmt.Printf("raw: %s\n", raw)
-		return
+		return map[string]any{}
 	}
-	pretty, _ := json.MarshalIndent(pick(m,
+	picked := pick(m,
 		"ja3_hash", "ja3", "ja4", "akamai_fingerprint", "akamai_fingerprint_hash",
 		"http_version", "tls_version_negotiated", "user_agent",
-	), "", "  ")
+	)
+	pretty, _ := json.MarshalIndent(picked, "", "  ")
 	fmt.Println(string(pretty))
-	fp, _ := m["akamai_fingerprint"].(string)
-	if fp == "" {
-		if h2, ok := m["http2"].(map[string]any); ok {
-			fp, _ = h2["akamai_fingerprint"].(string)
-		}
-	}
-	if fp != "" {
-		want := "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"
-		if fp == want {
-			fmt.Println("akamai_fingerprint: MATCHES Chrome_131 target")
+	fp, _ := picked["akamai_fingerprint"].(string)
+	if fp != "" && wantAkamai != "" {
+		if fp == wantAkamai {
+			fmt.Println("akamai_fingerprint: MATCHES target")
 		} else {
-			fmt.Printf("akamai_fingerprint: DOES NOT match\n  got:  %s\n  want: %s\n", fp, want)
+			fmt.Printf("akamai_fingerprint: DOES NOT match\n  got:  %s\n  want: %s\n", fp, wantAkamai)
 		}
 	}
+	return picked
 }
 
 func pick(m map[string]any, keys ...string) map[string]any {
@@ -97,7 +180,6 @@ func pick(m map[string]any, keys ...string) map[string]any {
 			out[k] = v
 		}
 	}
-	// peet sometimes nests tls / http2
 	if tlsObj, ok := m["tls"].(map[string]any); ok {
 		for _, k := range []string{"ja3_hash", "ja3", "ja4"} {
 			if _, have := out[k]; !have {
@@ -119,12 +201,21 @@ func pick(m map[string]any, keys ...string) map[string]any {
 	return out
 }
 
-func fetchWithChrome() ([]byte, error) {
+func headerTableSize(settings []http2.Setting) uint32 {
+	for _, s := range settings {
+		if s.ID == http2.SettingHeaderTableSize {
+			return s.Val
+		}
+	}
+	return 4096
+}
+
+func fetchWithProfile(p profileSpec) ([]byte, error) {
 	conn, err := net.DialTimeout("tcp", "tls.peet.ws:443", 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	uconn := utls.UClient(conn, &utls.Config{ServerName: "tls.peet.ws"}, utls.HelloChrome_131)
+	uconn := utls.UClient(conn, &utls.Config{ServerName: "tls.peet.ws"}, p.Hello)
 	if err := uconn.Handshake(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("handshake: %w", err)
@@ -139,24 +230,32 @@ func fetchWithChrome() ([]byte, error) {
 		return nil, err
 	}
 	fr := http2.NewFramer(uconn, uconn)
-	fr.ReadMetaHeaders = hpack.NewDecoder(chromeH2HeaderTableSize, nil)
-	if err := fr.WriteSettings(chromeH2Settings...); err != nil {
+	fr.ReadMetaHeaders = hpack.NewDecoder(headerTableSize(p.Settings), nil)
+	if err := fr.WriteSettings(p.Settings...); err != nil {
 		_ = uconn.Close()
 		return nil, err
 	}
-	if err := fr.WriteWindowUpdate(0, chromeH2ConnWindowUpdate); err != nil {
+	if err := fr.WriteWindowUpdate(0, p.ConnWindowUpdate); err != nil {
 		_ = uconn.Close()
 		return nil, err
 	}
 
 	var hbuf bytes.Buffer
 	enc := hpack.NewEncoder(&hbuf)
+	pseudo := map[string]string{
+		":method":    "GET",
+		":authority": "tls.peet.ws",
+		":scheme":    "https",
+		":path":      "/api/all",
+	}
+	for _, name := range p.PseudoOrder {
+		if err := enc.WriteField(hpack.HeaderField{Name: name, Value: pseudo[name]}); err != nil {
+			_ = uconn.Close()
+			return nil, err
+		}
+	}
 	for _, f := range []hpack.HeaderField{
-		{Name: ":method", Value: "GET"},
-		{Name: ":authority", Value: "tls.peet.ws"},
-		{Name: ":scheme", Value: "https"},
-		{Name: ":path", Value: "/api/all"},
-		{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
+		{Name: "user-agent", Value: p.UA},
 		{Name: "accept", Value: "*/*"},
 	} {
 		if err := enc.WriteField(f); err != nil {
@@ -176,6 +275,7 @@ func fetchWithChrome() ([]byte, error) {
 
 	var body bytes.Buffer
 	done := false
+	statusOK := false
 	for !done {
 		f, err := fr.ReadFrame()
 		if err != nil {
@@ -190,15 +290,12 @@ func fetchWithChrome() ([]byte, error) {
 		case *http2.WindowUpdateFrame:
 		case *http2.PingFrame:
 			_ = fr.WritePing(true, frame.Data)
-		case *http2.HeadersFrame:
-			// Meta via ReadMetaHeaders when EndHeaders
-			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
-				_ = mh
-			}
-			if frame.StreamEnded() {
-				done = true
-			}
 		case *http2.MetaHeadersFrame:
+			for _, hf := range frame.Fields {
+				if hf.Name == ":status" && hf.Value == "200" {
+					statusOK = true
+				}
+			}
 			if frame.StreamEnded() {
 				done = true
 			}
@@ -207,24 +304,23 @@ func fetchWithChrome() ([]byte, error) {
 			if frame.StreamEnded() {
 				done = true
 			}
-		case *http2.RSTStreamFrame:
-			_ = uconn.Close()
-			return nil, fmt.Errorf("RST_STREAM: %v", frame.ErrCode)
 		case *http2.GoAwayFrame:
 			_ = uconn.Close()
 			return nil, fmt.Errorf("GOAWAY: %v", frame.ErrCode)
+		case *http2.RSTStreamFrame:
+			_ = uconn.Close()
+			return nil, fmt.Errorf("RST_STREAM: %v", frame.ErrCode)
 		}
 	}
 	_ = uconn.Close()
+	if !statusOK && body.Len() == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
 	return body.Bytes(), nil
 }
 
 func fetchWithGo() ([]byte, error) {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{ServerName: "tls.peet.ws"},
-		ForceAttemptHTTP2: true,
-	}
-	client := &http.Client{Transport: tr, Timeout: 20 * time.Second}
+	client := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{}}}
 	resp, err := client.Get(peetURL)
 	if err != nil {
 		return nil, err

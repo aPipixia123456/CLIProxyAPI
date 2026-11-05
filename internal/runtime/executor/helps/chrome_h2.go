@@ -12,53 +12,47 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
 
-// Chrome_131 Akamai HTTP/2 fingerprint (SETTINGS | WINDOW_UPDATE | PRIORITY | pseudo).
-// Values match bogdanfinn/tls-client profiles.Chrome_131 / Chrome_133+:
+// Browser-shaped HTTP/2 (SETTINGS | WINDOW_UPDATE | PRIORITY | pseudo) for the
+// chatgpt.com uTLS path. Profile values live in browser_fingerprint.go and match
+// bogdanfinn/tls-client tables so TLS ClientHello and H2 Akamai stay paired.
 //
-//	1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
-//
-// golang.org/x/net/http2.Transport cannot emit this fingerprint: it hard-codes
+// golang.org/x/net/http2.Transport cannot emit browser fingerprints: it hard-codes
 // SETTINGS order (ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, …), always
 // advertises MAX_FRAME_SIZE, and EncodeHeaders emits a,m,p,s. Scheme A therefore
-// drives the Chrome path with Framer+hpack instead of Transport.NewClientConn.
+// drives this path with Framer+hpack instead of Transport.NewClientConn.
 //
 // TODO(scheme-B): expose TLSClientProfile on HTTPWireProfile so pluginhost can
 // opt into this client without forking the chatgpt.com host check.
 const (
-	chromeH2HeaderTableSize      uint32 = 65536
-	chromeH2EnablePush           uint32 = 0
-	chromeH2InitialWindowSize    uint32 = 6291456
-	chromeH2MaxHeaderListSize    uint32 = 262144
-	chromeH2ConnWindowUpdate     uint32 = 15663105
 	chromeH2DefaultStreamSendWin int64  = 65535
 	chromeH2DefaultMaxFrame      uint32 = 16384
 )
 
 var chromeH2ClientPreface = []byte(http2.ClientPreface)
 
-var chromeH2Settings = []http2.Setting{
-	{ID: http2.SettingHeaderTableSize, Val: chromeH2HeaderTableSize},
-	{ID: http2.SettingEnablePush, Val: chromeH2EnablePush},
-	{ID: http2.SettingInitialWindowSize, Val: chromeH2InitialWindowSize},
-	{ID: http2.SettingMaxHeaderListSize, Val: chromeH2MaxHeaderListSize},
-}
-
-// chromeH2PseudoHeaderOrder is Chrome's :method :authority :scheme :path.
-var chromeH2PseudoHeaderOrder = []string{":method", ":authority", ":scheme", ":path"}
+// Legacy aliases kept for tests that assert the chrome_131 defaults.
+var (
+	chromeH2Settings          = browserFingerprintChrome131.Settings
+	chromeH2PseudoHeaderOrder = browserFingerprintChrome131.PseudoOrder
+	chromeH2ConnWindowUpdate  = browserFingerprintChrome131.ConnWindowUpdate
+	chromeH2HeaderTableSize   = browserFingerprintChrome131.headerTableSize()
+)
 
 // chromeH2Conn is a single TCP/TLS connection speaking Chrome-shaped HTTP/2.
 // Requests are serialized; at most one response body may be open at a time so
 // SSE streams are not torn down by a sibling RoundTrip on the same conn.
 type chromeH2Conn struct {
-	conn net.Conn
-	fr   *http2.Framer
-	henc *hpack.Encoder
-	hbuf bytes.Buffer
+	conn    net.Conn
+	fr      *http2.Framer
+	henc    *hpack.Encoder
+	hbuf    bytes.Buffer
+	profile *browserFingerprintProfile
 
 	mu     sync.Mutex
 	nextID uint32
@@ -76,8 +70,16 @@ type chromeH2Conn struct {
 }
 
 func newChromeH2Conn(conn net.Conn) (*chromeH2Conn, error) {
+	return newChromeH2ConnWithProfile(conn, browserFingerprintChrome131)
+}
+
+func newChromeH2ConnWithProfile(conn net.Conn, profile *browserFingerprintProfile) (*chromeH2Conn, error) {
+	if profile == nil {
+		profile = browserFingerprintChrome131
+	}
 	c := &chromeH2Conn{
 		conn:                 conn,
+		profile:              profile,
 		nextID:               1,
 		connSendWin:          chromeH2DefaultStreamSendWin,
 		streamSendWin:        chromeH2DefaultStreamSendWin,
@@ -86,16 +88,16 @@ func newChromeH2Conn(conn net.Conn) (*chromeH2Conn, error) {
 	}
 	c.henc = hpack.NewEncoder(&c.hbuf)
 	c.fr = http2.NewFramer(conn, conn)
-	c.fr.ReadMetaHeaders = hpack.NewDecoder(chromeH2HeaderTableSize, nil)
-	c.fr.MaxHeaderListSize = chromeH2MaxHeaderListSize
+	c.fr.ReadMetaHeaders = hpack.NewDecoder(profile.headerTableSize(), nil)
+	c.fr.MaxHeaderListSize = profile.maxHeaderListSize()
 
 	if _, err := conn.Write(chromeH2ClientPreface); err != nil {
 		return nil, fmt.Errorf("chrome h2: write preface: %w", err)
 	}
-	if err := c.fr.WriteSettings(chromeH2Settings...); err != nil {
+	if err := c.fr.WriteSettings(profile.Settings...); err != nil {
 		return nil, fmt.Errorf("chrome h2: write settings: %w", err)
 	}
-	if err := c.fr.WriteWindowUpdate(0, chromeH2ConnWindowUpdate); err != nil {
+	if err := c.fr.WriteWindowUpdate(0, profile.ConnWindowUpdate); err != nil {
 		return nil, fmt.Errorf("chrome h2: write window update: %w", err)
 	}
 	return c, nil
@@ -151,7 +153,9 @@ func (c *chromeH2Conn) roundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
+	stopCancel := armConnCancel(req.Context(), c.conn)
 	if err := c.writeHeadersLocked(streamID, req, bodyBytes); err != nil {
+		stopCancel()
 		c.busy = false
 		c.markBroken()
 		c.mu.Unlock()
@@ -159,6 +163,7 @@ func (c *chromeH2Conn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if len(bodyBytes) > 0 {
 		if err := c.writeDataLocked(req.Context(), streamID, bodyBytes); err != nil {
+			stopCancel()
 			c.busy = false
 			c.markBroken()
 			c.mu.Unlock()
@@ -168,11 +173,16 @@ func (c *chromeH2Conn) roundTrip(req *http.Request) (*http.Response, error) {
 
 	status, hdr, endStream, err := c.readResponseHeadersLocked(req.Context(), streamID)
 	if err != nil {
+		stopCancel()
 		c.busy = false
 		c.markBroken()
 		c.mu.Unlock()
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
+	stopCancel()
 
 	body := &chromeH2Body{
 		conn:     c,
@@ -233,7 +243,7 @@ func (c *chromeH2Conn) writeHeadersLocked(streamID uint32, req *http.Request, bo
 		":scheme":    scheme,
 		":path":      path,
 	}
-	for _, name := range chromeH2PseudoHeaderOrder {
+	for _, name := range c.profile.PseudoOrder {
 		if err := c.henc.WriteField(hpack.HeaderField{Name: name, Value: pseudo[name]}); err != nil {
 			return fmt.Errorf("chrome h2: encode %s: %w", name, err)
 		}
@@ -493,6 +503,31 @@ func (c *chromeH2Conn) readBodyFrameLocked(ctx context.Context, streamID uint32)
 	}
 }
 
+// armConnCancel forces pending reads/writes to unblock when ctx is canceled
+// by expiring the connection deadline. Call the returned stop func when the
+// wait ends so a successful RoundTrip does not leave a stale deadline.
+func armConnCancel(ctx context.Context, conn net.Conn) (stop func()) {
+	if ctx == nil || conn == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+		_ = conn.SetDeadline(time.Time{})
+	}
+}
+
 func isChromeH2SkippedHeader(lower string) bool {
 	switch lower {
 	case "host", "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade":
@@ -525,14 +560,20 @@ func (b *chromeH2Body) Read(p []byte) (int, error) {
 		if ctx == nil {
 			ctx = context.Background()
 		}
+		stopCancel := armConnCancel(ctx, b.conn.conn)
 		b.conn.mu.Lock()
 		data, end, err := b.conn.readBodyFrameLocked(ctx, b.streamID)
 		if err != nil {
 			b.conn.markBroken()
 			b.conn.busy = false
 			b.conn.mu.Unlock()
+			stopCancel()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return 0, ctxErr
+			}
 			return 0, err
 		}
+		stopCancel()
 		b.buf = data
 		b.ended = end
 		if end {
@@ -572,12 +613,7 @@ func (b *chromeH2Body) Close() error {
 	return nil
 }
 
-// chromeH2SettingsFingerprint returns the Akamai SETTINGS|WINDOW_UPDATE portion
-// expected from chromeH2Settings (no PRIORITY / pseudo — those are request-scoped).
+// chromeH2SettingsFingerprint returns the default chrome_131 Akamai fingerprint.
 func chromeH2SettingsFingerprint() string {
-	parts := make([]string, 0, len(chromeH2Settings))
-	for _, s := range chromeH2Settings {
-		parts = append(parts, fmt.Sprintf("%d:%d", s.ID, s.Val))
-	}
-	return strings.Join(parts, ";") + fmt.Sprintf("|%d|0|m,a,s,p", chromeH2ConnWindowUpdate)
+	return browserFingerprintChrome131.akamaiFingerprint()
 }

@@ -27,6 +27,13 @@ func TestChromeH2SettingsFingerprintMatchesChrome131(t *testing.T) {
 	if chromeClientHelloID.Client != "Chrome" || chromeClientHelloID.Version != "131" {
 		t.Fatalf("chromeClientHelloID = %s/%s, want Chrome/131", chromeClientHelloID.Client, chromeClientHelloID.Version)
 	}
+	p := DefaultBrowserFingerprintProfile()
+	if p.ClientHello.Client != "Chrome" || p.ClientHello.Version != "131" {
+		t.Fatalf("default profile hello = %s/%s", p.ClientHello.Client, p.ClientHello.Version)
+	}
+	if p.akamaiFingerprint() != want {
+		t.Fatalf("default profile akamai = %q", p.akamaiFingerprint())
+	}
 }
 
 func TestChromeH2ConnEmitsChromePrefaceSettingsAndPseudoOrder(t *testing.T) {
@@ -239,6 +246,11 @@ func TestCachedChromeRoundTripperReusesInstance(t *testing.T) {
 	c := cachedChromeRoundTripper("socks5://127.0.0.1:2")
 	if a == c {
 		t.Fatal("expected distinct RoundTripper for different proxy")
+	}
+	// Same proxy, different profile must not collide (one-account-one-fingerprint).
+	d := cachedChromeRoundTripperForProfile("socks5://127.0.0.1:1", browserFingerprintSafari17)
+	if a == d {
+		t.Fatal("expected distinct RoundTripper for different fingerprint_profile")
 	}
 }
 
@@ -924,5 +936,142 @@ func TestChromeH2StreamWindowUpdateIsRequired(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestSafariH2ConnEmitsSafariSettingsAndPseudoOrder(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	type capture struct {
+		settings []http2.Setting
+		window   uint32
+		pseudos  []string
+	}
+	result := make(chan capture, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+		buf := make([]byte, len(chromeH2ClientPreface))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			errCh <- err
+			return
+		}
+		fr := http2.NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+
+		settingsFrame, err := fr.ReadFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		sf, ok := settingsFrame.(*http2.SettingsFrame)
+		if !ok {
+			errCh <- fmt.Errorf("want SETTINGS, got %T", settingsFrame)
+			return
+		}
+		var settings []http2.Setting
+		_ = sf.ForeachSetting(func(s http2.Setting) error {
+			settings = append(settings, s)
+			return nil
+		})
+
+		wuFrame, err := fr.ReadFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		wu, ok := wuFrame.(*http2.WindowUpdateFrame)
+		if !ok || wu.StreamID != 0 {
+			errCh <- fmt.Errorf("want conn WINDOW_UPDATE, got %T", wuFrame)
+			return
+		}
+
+		hdrFrame, err := fr.ReadFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		mh, ok := hdrFrame.(*http2.MetaHeadersFrame)
+		if !ok {
+			errCh <- fmt.Errorf("want HEADERS, got %T", hdrFrame)
+			return
+		}
+		var pseudos []string
+		for _, f := range mh.Fields {
+			if strings.HasPrefix(f.Name, ":") {
+				pseudos = append(pseudos, f.Name)
+			}
+		}
+
+		var encBuf bytes.Buffer
+		enc := hpack.NewEncoder(&encBuf)
+		_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      mh.StreamID,
+			BlockFragment: encBuf.Bytes(),
+			EndStream:     true,
+			EndHeaders:    true,
+		}); err != nil {
+			errCh <- err
+			return
+		}
+		result <- capture{settings: settings, window: wu.Increment, pseudos: pseudos}
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+	_ = clientConn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	chromeConn, err := newChromeH2ConnWithProfile(clientConn, browserFingerprintSafari17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://chatgpt.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := chromeConn.roundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case got := <-result:
+		wantSettings := browserFingerprintSafari17.Settings
+		if len(got.settings) != len(wantSettings) {
+			t.Fatalf("settings = %#v, want %#v", got.settings, wantSettings)
+		}
+		for i := range wantSettings {
+			if got.settings[i] != wantSettings[i] {
+				t.Fatalf("settings[%d] = %#v, want %#v", i, got.settings[i], wantSettings[i])
+			}
+		}
+		if got.window != browserFingerprintSafari17.ConnWindowUpdate {
+			t.Fatalf("window update = %d, want %d", got.window, browserFingerprintSafari17.ConnWindowUpdate)
+		}
+		wantPseudos := []string{":method", ":scheme", ":path", ":authority"}
+		if strings.Join(got.pseudos, ",") != strings.Join(wantPseudos, ",") {
+			t.Fatalf("pseudos = %v, want %v", got.pseudos, wantPseudos)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server capture")
 	}
 }
